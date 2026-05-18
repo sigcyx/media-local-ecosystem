@@ -24,6 +24,7 @@ const pool = new Pool({
 
 const queue = new Queue('media-processing', { connection: { url: process.env.REDIS_URL } });
 const sourceRoot = process.env.SOURCE_MEDIA_PATH || '/media/source';
+const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://ai-service:8000';
 const apiPort = Number(process.env.API_PORT || 8080);
 const jwtAccessSecret = process.env.JWT_ACCESS_SECRET || 'dev-access-secret';
 const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret';
@@ -342,6 +343,58 @@ app.get('/uploads/activity', async (req, res) => {
     [limit]
   );
   return res.json({ items: result.rows });
+});
+
+app.post('/search/semantic', async (req, res) => {
+  const query = String(req.body?.query || '').trim();
+  const limitRaw = Number(req.body?.limit ?? 20);
+  const limit = Number.isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 100);
+
+  if (!query) {
+    return res.status(400).json({ error: 'query is required' });
+  }
+
+  let embedding;
+  try {
+    const aiResponse = await fetch(`${aiServiceUrl}/embed/text`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-request-id': req.requestId
+      },
+      body: JSON.stringify({ query })
+    });
+
+    if (!aiResponse.ok) {
+      const body = await aiResponse.text();
+      log('error', 'ai text embedding request failed', {
+        request_id: req.requestId,
+        status_code: aiResponse.status,
+        error_message: body
+      });
+      return res.status(502).json({ error: 'embedding service unavailable' });
+    }
+
+    const payload = await aiResponse.json();
+    embedding = payload.embedding;
+    if (!embedding) return res.status(502).json({ error: 'embedding service unavailable' });
+  } catch (error) {
+    log('error', 'ai text embedding request error', { request_id: req.requestId, error_message: String(error) });
+    return res.status(502).json({ error: 'embedding service unavailable' });
+  }
+
+  const result = await pool.query(
+    `SELECT asset_id, file_path, mime_type, captured_at, distance
+     FROM semantic_search($1::vector, $2)`,
+    [embedding, limit]
+  );
+
+  const items = result.rows.map((row) => ({
+    ...row,
+    thumbnail_url: `/api/assets/${row.asset_id}/thumbnail`
+  }));
+
+  return res.json({ results: items });
 });
 
 app.listen(apiPort, () => {
