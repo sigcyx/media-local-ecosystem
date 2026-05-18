@@ -14,7 +14,6 @@ import client from 'prom-client';
 dotenv.config();
 
 const app = express();
-const upload = multer({ dest: '/tmp/uploads' });
 const pool = new Pool({
   host: process.env.POSTGRES_HOST,
   port: Number(process.env.POSTGRES_PORT || 5432),
@@ -31,6 +30,17 @@ const jwtAccessSecret = process.env.JWT_ACCESS_SECRET || 'dev-access-secret';
 const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret';
 const accessTtlSeconds = Number(process.env.JWT_ACCESS_TTL_SECONDS || 3600);
 const refreshTtlSeconds = Number(process.env.JWT_REFRESH_TTL_SECONDS || 2592000);
+const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 25);
+const maxUploadBytes = Number.isFinite(maxUploadMb) && maxUploadMb > 0 ? Math.floor(maxUploadMb * 1024 * 1024) : 25 * 1024 * 1024;
+const allowedMimeTypes = (process.env.ALLOWED_MIME_TYPES || 'image/jpeg,image/png,image/webp,image/heic,video/mp4,video/quicktime')
+  .split(',')
+  .map((v) => v.trim())
+  .filter(Boolean);
+const allowedMimeTypeSet = new Set(allowedMimeTypes);
+const upload = multer({
+  dest: '/tmp/uploads',
+  limits: { fileSize: maxUploadBytes }
+});
 
 const register = new client.Registry();
 client.collectDefaultMetrics({ register, prefix: 'media_backend_' });
@@ -270,79 +280,95 @@ app.post('/auth/logout', async (req, res) => {
   return res.json({ ok: true });
 });
 
-app.post('/upload', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'file is required' });
-
-    const tempPath = req.file.path;
-    const buffer = await fs.readFile(tempPath);
-    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-
-    const ext = path.extname(req.file.originalname || '');
-    const filename = `${sha256}${ext}`;
-    const finalPath = path.join(sourceRoot, filename);
-
-    const existing = await pool.query('SELECT id FROM media_assets WHERE sha256_hash = $1 LIMIT 1', [sha256]);
-    if (existing.rowCount > 0) {
-      const existingAssetId = existing.rows[0].id;
-      await pool.query(
-        `INSERT INTO upload_activity (asset_id, sha256_hash, status)
-         VALUES ($1, $2, 'duplicate')`,
-        [existingAssetId, sha256]
-      );
-      await fs.unlink(tempPath);
-      uploadRequestsTotal.inc({ result: 'duplicate' });
-      return res.status(200).json({ duplicate: true, sha256 });
+app.post('/upload', (req, res) => {
+  upload.single('file')(req, res, async (uploadErr) => {
+    if (uploadErr) {
+      uploadRequestsTotal.inc({ result: 'failed' });
+      if (uploadErr.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'payload too large' });
+      }
+      log('error', 'upload middleware failed', { request_id: req.requestId, error_message: String(uploadErr?.message || uploadErr) });
+      return res.status(400).json({ error: 'invalid upload payload' });
     }
 
-    await fs.copyFile(tempPath, finalPath);
-    await fs.unlink(tempPath);
+    try {
+      if (!req.file) return res.status(400).json({ error: 'file is required' });
+      if (!allowedMimeTypeSet.has(req.file.mimetype)) {
+        await fs.unlink(req.file.path).catch(() => {});
+        uploadRequestsTotal.inc({ result: 'failed' });
+        return res.status(415).json({ error: 'unsupported media type' });
+      }
 
-    const exif = await exifr.parse(finalPath, { gps: true }).catch(() => ({}));
+      const tempPath = req.file.path;
+      const buffer = await fs.readFile(tempPath);
+      const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
 
-    const insertAsset = await pool.query(
-      `INSERT INTO media_assets (sha256_hash, file_path, file_size_bytes, mime_type, captured_at)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id`,
-      [sha256, finalPath, req.file.size, req.file.mimetype, exif?.DateTimeOriginal || null]
-    );
+      const ext = path.extname(req.file.originalname || '');
+      const filename = `${sha256}${ext}`;
+      const finalPath = path.join(sourceRoot, filename);
 
-    const mediaId = insertAsset.rows[0].id;
-    await pool.query(
-      `INSERT INTO media_exif (media_id, camera_model, latitude, longitude, shutter_speed, iso)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [
+      const existing = await pool.query('SELECT id FROM media_assets WHERE sha256_hash = $1 LIMIT 1', [sha256]);
+      if (existing.rowCount > 0) {
+        const existingAssetId = existing.rows[0].id;
+        await pool.query(
+          `INSERT INTO upload_activity (asset_id, sha256_hash, status)
+           VALUES ($1, $2, 'duplicate')`,
+          [existingAssetId, sha256]
+        );
+        await fs.unlink(tempPath);
+        uploadRequestsTotal.inc({ result: 'duplicate' });
+        return res.status(200).json({ duplicate: true, sha256 });
+      }
+
+      await fs.copyFile(tempPath, finalPath);
+      await fs.unlink(tempPath);
+
+      const exif = await exifr.parse(finalPath, { gps: true }).catch(() => ({}));
+
+      const insertAsset = await pool.query(
+        `INSERT INTO media_assets (sha256_hash, file_path, file_size_bytes, mime_type, captured_at)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id`,
+        [sha256, finalPath, req.file.size, req.file.mimetype, exif?.DateTimeOriginal || null]
+      );
+
+      const mediaId = insertAsset.rows[0].id;
+      await pool.query(
+        `INSERT INTO media_exif (media_id, camera_model, latitude, longitude, shutter_speed, iso)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          mediaId,
+          exif?.Model || null,
+          exif?.latitude || null,
+          exif?.longitude || null,
+          exif?.ExposureTime ? String(exif.ExposureTime) : null,
+          exif?.ISO || null
+        ]
+      );
+
+      const activity = await pool.query(
+        `INSERT INTO upload_activity (asset_id, sha256_hash, status)
+         VALUES ($1, $2, 'queued')
+         RETURNING id`,
+        [mediaId, sha256]
+      );
+
+      const activityId = activity.rows[0].id;
+      await queue.add('process-media', {
         mediaId,
-        exif?.Model || null,
-        exif?.latitude || null,
-        exif?.longitude || null,
-        exif?.ExposureTime ? String(exif.ExposureTime) : null,
-        exif?.ISO || null
-      ]
-    );
-
-    const activity = await pool.query(
-      `INSERT INTO upload_activity (asset_id, sha256_hash, status)
-       VALUES ($1, $2, 'queued')
-       RETURNING id`,
-      [mediaId, sha256]
-    );
-
-    const activityId = activity.rows[0].id;
-    await queue.add('process-media', {
-      mediaId,
-      activityId,
-      path: finalPath,
-      mimeType: req.file.mimetype,
-      ingestedAt: new Date().toISOString()
-    });
-    uploadRequestsTotal.inc({ result: 'accepted' });
-    return res.status(201).json({ id: mediaId, sha256 });
-  } catch (error) {
-    uploadRequestsTotal.inc({ result: 'failed' });
-    log('error', 'upload failed', { request_id: req.requestId, error_message: String(error?.message || error) });
-    return res.status(500).json({ error: 'upload failed' });
-  }
+        activityId,
+        path: finalPath,
+        mimeType: req.file.mimetype,
+        ingestedAt: new Date().toISOString()
+      });
+      uploadRequestsTotal.inc({ result: 'accepted' });
+      return res.status(201).json({ id: mediaId, sha256 });
+    } catch (error) {
+      uploadRequestsTotal.inc({ result: 'failed' });
+      log('error', 'upload failed', { request_id: req.requestId, error_message: String(error?.message || error) });
+      return res.status(500).json({ error: 'upload failed' });
+    }
+  });
 });
 
 app.get('/timeline', async (req, res) => {
