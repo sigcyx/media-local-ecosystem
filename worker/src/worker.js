@@ -18,22 +18,52 @@ const pool = new Pool({
 });
 
 new Worker('media-processing', async (job) => {
-  const { mediaId, path: originalPath } = job.data;
+  const { mediaId, activityId, path: originalPath } = job.data;
   const thumbPath = path.join(derivedRoot, `${mediaId}.jpg`);
 
-  await fs.mkdir(derivedRoot, { recursive: true });
-  await sharp(originalPath).resize(640, 640, { fit: 'inside' }).jpeg({ quality: 80 }).toFile(thumbPath);
+  try {
+    if (activityId) {
+      await pool.query(
+        `UPDATE upload_activity
+         SET status = 'processing', updated_at = NOW(), last_error = NULL
+         WHERE id = $1`,
+        [activityId]
+      );
+    }
 
-  const ai = await axios.post(`${process.env.AI_SERVICE_URL}/embed`, { media_id: mediaId, path: originalPath });
+    await fs.mkdir(derivedRoot, { recursive: true });
+    await sharp(originalPath).resize(640, 640, { fit: 'inside' }).jpeg({ quality: 80 }).toFile(thumbPath);
 
-  await pool.query(
-    `INSERT INTO semantic_embeddings (asset_id, embedding)
-     VALUES ($1, $2)
-     ON CONFLICT (asset_id)
-     DO UPDATE SET embedding = EXCLUDED.embedding,
-                   created_at = NOW()`,
-    [mediaId, ai.data.clip_embedding]
-  );
+    const ai = await axios.post(`${process.env.AI_SERVICE_URL}/embed`, { media_id: mediaId, path: originalPath });
+
+    await pool.query(
+      `INSERT INTO semantic_embeddings (asset_id, embedding)
+       VALUES ($1, $2)
+       ON CONFLICT (asset_id)
+       DO UPDATE SET embedding = EXCLUDED.embedding,
+                     created_at = NOW()`,
+      [mediaId, ai.data.clip_embedding]
+    );
+
+    if (activityId) {
+      await pool.query(
+        `UPDATE upload_activity
+         SET status = 'ready', updated_at = NOW(), last_error = NULL
+         WHERE id = $1`,
+        [activityId]
+      );
+    }
+  } catch (error) {
+    if (activityId) {
+      await pool.query(
+        `UPDATE upload_activity
+         SET status = 'failed', updated_at = NOW(), last_error = $2
+         WHERE id = $1`,
+        [activityId, String(error?.message || error)]
+      );
+    }
+    throw error;
+  }
 }, { connection: { url: process.env.REDIS_URL } });
 
 console.log('worker running');

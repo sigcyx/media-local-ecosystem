@@ -51,6 +51,20 @@ function log(level, message, extra = {}) {
   console.log(JSON.stringify(payload));
 }
 
+function encodeCursor(sortTs, assetId) {
+  return Buffer.from(JSON.stringify({ sortTs, assetId })).toString('base64url');
+}
+
+function decodeCursor(cursor) {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+    if (!parsed.sortTs || !parsed.assetId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function signAccessToken(user) {
   return jwt.sign(
     { sub: user.id, role: user.role, email: user.email, type: 'access' },
@@ -196,8 +210,14 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   const filename = `${sha256}${ext}`;
   const finalPath = path.join(sourceRoot, filename);
 
-  const [{ count }] = (await pool.query('SELECT COUNT(*)::int AS count FROM media_assets WHERE sha256_hash = $1', [sha256])).rows;
-  if (count > 0) {
+  const existing = await pool.query('SELECT id FROM media_assets WHERE sha256_hash = $1 LIMIT 1', [sha256]);
+  if (existing.rowCount > 0) {
+    const existingAssetId = existing.rows[0].id;
+    await pool.query(
+      `INSERT INTO upload_activity (asset_id, sha256_hash, status)
+       VALUES ($1, $2, 'duplicate')`,
+      [existingAssetId, sha256]
+    );
     await fs.unlink(tempPath);
     return res.status(200).json({ duplicate: true, sha256 });
   }
@@ -228,8 +248,100 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     ]
   );
 
-  await queue.add('process-media', { mediaId, path: finalPath, mimeType: req.file.mimetype, ingestedAt: new Date().toISOString() });
+  const activity = await pool.query(
+    `INSERT INTO upload_activity (asset_id, sha256_hash, status)
+     VALUES ($1, $2, 'queued')
+     RETURNING id`,
+    [mediaId, sha256]
+  );
+
+  const activityId = activity.rows[0].id;
+  await queue.add('process-media', {
+    mediaId,
+    activityId,
+    path: finalPath,
+    mimeType: req.file.mimetype,
+    ingestedAt: new Date().toISOString()
+  });
   return res.status(201).json({ id: mediaId, sha256 });
+});
+
+app.get('/timeline', async (req, res) => {
+  const limitRaw = Number(req.query.limit || 30);
+  const limit = Number.isNaN(limitRaw) ? 30 : Math.min(Math.max(limitRaw, 1), 100);
+  const status = req.query.status ? String(req.query.status) : null;
+  const cursor = req.query.cursor ? decodeCursor(String(req.query.cursor)) : null;
+
+  const params = [limit + 1];
+  let where = '';
+  if (status) {
+    params.push(status);
+    where += ` AND COALESCE(la.status, 'ready') = $${params.length}`;
+  }
+
+  if (cursor) {
+    params.push(cursor.sortTs);
+    params.push(cursor.assetId);
+    where += ` AND (
+      COALESCE(m.captured_at, m.created_at) < $${params.length - 1}::timestamptz
+      OR (
+        COALESCE(m.captured_at, m.created_at) = $${params.length - 1}::timestamptz
+        AND m.id < $${params.length}::uuid
+      )
+    )`;
+  }
+
+  const result = await pool.query(
+    `WITH latest_activity AS (
+       SELECT DISTINCT ON (asset_id)
+         asset_id, status, last_error, updated_at
+       FROM upload_activity
+       WHERE asset_id IS NOT NULL
+       ORDER BY asset_id, updated_at DESC
+     )
+     SELECT
+       m.id AS asset_id,
+       m.file_path,
+       m.mime_type,
+       m.captured_at,
+       m.created_at,
+       '/api/assets/' || m.id::text || '/thumbnail' AS thumbnail_url,
+       COALESCE(la.status, 'ready') AS processing_status
+     FROM media_assets m
+     LEFT JOIN latest_activity la ON la.asset_id = m.id
+     WHERE 1=1 ${where}
+     ORDER BY COALESCE(m.captured_at, m.created_at) DESC, m.id DESC
+     LIMIT $1`,
+    params
+  );
+
+  const hasMore = result.rows.length > limit;
+  const rows = hasMore ? result.rows.slice(0, limit) : result.rows;
+  let nextCursor = null;
+  if (hasMore && rows.length > 0) {
+    const last = rows[rows.length - 1];
+    nextCursor = encodeCursor(last.captured_at || last.created_at, last.asset_id);
+  }
+
+  return res.json({ items: rows, next_cursor: nextCursor });
+});
+
+app.get('/uploads/activity', async (req, res) => {
+  const limitRaw = Number(req.query.limit || 50);
+  const limit = Number.isNaN(limitRaw) ? 50 : Math.min(Math.max(limitRaw, 1), 200);
+  const result = await pool.query(
+    `SELECT
+       asset_id,
+       sha256_hash,
+       status,
+       last_error,
+       updated_at
+     FROM upload_activity
+     ORDER BY updated_at DESC
+     LIMIT $1`,
+    [limit]
+  );
+  return res.json({ items: result.rows });
 });
 
 app.listen(apiPort, () => {

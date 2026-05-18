@@ -45,6 +45,16 @@ CREATE TABLE IF NOT EXISTS refresh_sessions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS upload_activity (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  asset_id UUID REFERENCES media_assets(id) ON DELETE CASCADE,
+  sha256_hash VARCHAR(64) NOT NULL,
+  status VARCHAR(20) NOT NULL CHECK (status IN ('queued', 'processing', 'ready', 'failed', 'duplicate')),
+  last_error TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS semantic_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
@@ -72,6 +82,10 @@ CREATE INDEX IF NOT EXISTS idx_facial_embeddings_asset_id ON facial_embeddings (
 CREATE INDEX IF NOT EXISTS idx_facial_embeddings_entity_id ON facial_embeddings (entity_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_sessions_user_id ON refresh_sessions (user_id);
 CREATE INDEX IF NOT EXISTS idx_refresh_sessions_expires_at ON refresh_sessions (expires_at);
+CREATE INDEX IF NOT EXISTS idx_upload_activity_asset_id ON upload_activity (asset_id);
+CREATE INDEX IF NOT EXISTS idx_upload_activity_sha256_hash ON upload_activity (sha256_hash);
+CREATE INDEX IF NOT EXISTS idx_upload_activity_status ON upload_activity (status);
+CREATE INDEX IF NOT EXISTS idx_upload_activity_updated_at ON upload_activity (updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_ann
   ON semantic_embeddings
