@@ -5,6 +5,8 @@ import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
 import dotenv from 'dotenv';
+import jwt from 'jsonwebtoken';
+import { verify as verifyArgon2 } from '@node-rs/argon2';
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
 
@@ -22,8 +24,166 @@ const pool = new Pool({
 
 const queue = new Queue('media-processing', { connection: { url: process.env.REDIS_URL } });
 const sourceRoot = process.env.SOURCE_MEDIA_PATH || '/media/source';
+const apiPort = Number(process.env.API_PORT || 8080);
+const jwtAccessSecret = process.env.JWT_ACCESS_SECRET || 'dev-access-secret';
+const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret';
+const accessTtlSeconds = Number(process.env.JWT_ACCESS_TTL_SECONDS || 3600);
+const refreshTtlSeconds = Number(process.env.JWT_REFRESH_TTL_SECONDS || 2592000);
+
+app.use(express.json());
+
+app.use((req, res, next) => {
+  const requestId = req.header('X-Request-Id') || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('X-Request-Id', requestId);
+  next();
+});
+
+function log(level, message, extra = {}) {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    level,
+    service: 'backend',
+    message,
+    ...extra
+  };
+  // eslint-disable-next-line no-console
+  console.log(JSON.stringify(payload));
+}
+
+function signAccessToken(user) {
+  return jwt.sign(
+    { sub: user.id, role: user.role, email: user.email, type: 'access' },
+    jwtAccessSecret,
+    { expiresIn: accessTtlSeconds }
+  );
+}
+
+function signRefreshToken(user, tokenJti) {
+  return jwt.sign(
+    { sub: user.id, role: user.role, type: 'refresh', jti: tokenJti },
+    jwtRefreshSecret,
+    { expiresIn: refreshTtlSeconds }
+  );
+}
+
+async function createSessionAndTokens(user) {
+  const tokenJti = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + refreshTtlSeconds * 1000);
+  await pool.query(
+    `INSERT INTO refresh_sessions (user_id, token_jti, expires_at)
+     VALUES ($1, $2, $3)`,
+    [user.id, tokenJti, expiresAt]
+  );
+
+  const accessToken = signAccessToken(user);
+  const refreshToken = signRefreshToken(user, tokenJti);
+  return { accessToken, refreshToken };
+}
+
+function authMiddleware(req, res, next) {
+  const publicPaths = ['/health', '/auth/login', '/auth/refresh'];
+  if (publicPaths.includes(req.path)) return next();
+
+  const auth = req.header('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+
+  try {
+    const decoded = jwt.verify(token, jwtAccessSecret);
+    if (decoded.type !== 'access') return res.status(401).json({ error: 'unauthorized' });
+    req.user = { id: decoded.sub, role: decoded.role, email: decoded.email };
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+}
+
+app.use(authMiddleware);
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
+
+app.get('/ready', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    return res.json({ status: 'ready' });
+  } catch (error) {
+    log('error', 'readiness check failed', { request_id: req.requestId, error_message: String(error) });
+    return res.status(503).json({ status: 'not_ready' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+
+  const userResult = await pool.query(
+    `SELECT id, email, password_hash, role, is_active
+     FROM users
+     WHERE lower(email) = lower($1)
+     LIMIT 1`,
+    [email]
+  );
+
+  if (userResult.rowCount === 0) return res.status(401).json({ error: 'invalid credentials' });
+  const user = userResult.rows[0];
+  if (!user.is_active) return res.status(403).json({ error: 'user disabled' });
+
+  const valid = await verifyArgon2(user.password_hash, password).catch(() => false);
+  if (!valid) return res.status(401).json({ error: 'invalid credentials' });
+
+  const { accessToken, refreshToken } = await createSessionAndTokens(user);
+  return res.json({ access_token: accessToken, refresh_token: refreshToken, expires_in: accessTtlSeconds, token_type: 'Bearer' });
+});
+
+app.post('/auth/refresh', async (req, res) => {
+  const { refresh_token: refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(400).json({ error: 'refresh_token is required' });
+
+  try {
+    const decoded = jwt.verify(refreshToken, jwtRefreshSecret);
+    if (decoded.type !== 'refresh' || !decoded.jti) return res.status(401).json({ error: 'invalid refresh token' });
+
+    const session = await pool.query(
+      `SELECT rs.id, rs.user_id, rs.token_jti, rs.expires_at, rs.revoked_at, u.email, u.role, u.is_active
+       FROM refresh_sessions rs
+       JOIN users u ON u.id = rs.user_id
+       WHERE rs.token_jti = $1
+       LIMIT 1`,
+      [decoded.jti]
+    );
+
+    if (session.rowCount === 0) return res.status(401).json({ error: 'invalid refresh token' });
+    const row = session.rows[0];
+
+    if (row.revoked_at || new Date(row.expires_at) < new Date() || !row.is_active) {
+      return res.status(401).json({ error: 'invalid refresh token' });
+    }
+
+    await pool.query('UPDATE refresh_sessions SET revoked_at = NOW() WHERE id = $1', [row.id]);
+    const user = { id: row.user_id, email: row.email, role: row.role };
+    const tokens = await createSessionAndTokens(user);
+    return res.json({ access_token: tokens.accessToken, refresh_token: tokens.refreshToken, expires_in: accessTtlSeconds, token_type: 'Bearer' });
+  } catch {
+    return res.status(401).json({ error: 'invalid refresh token' });
+  }
+});
+
+app.post('/auth/logout', async (req, res) => {
+  const { refresh_token: refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(400).json({ error: 'refresh_token is required' });
+
+  try {
+    const decoded = jwt.verify(refreshToken, jwtRefreshSecret);
+    if (decoded?.jti) {
+      await pool.query('UPDATE refresh_sessions SET revoked_at = NOW() WHERE token_jti = $1 AND revoked_at IS NULL', [decoded.jti]);
+    }
+  } catch {
+    return res.status(401).json({ error: 'invalid refresh token' });
+  }
+
+  return res.json({ ok: true });
+});
 
 app.post('/upload', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'file is required' });
@@ -68,10 +228,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     ]
   );
 
-  await queue.add('process-media', { mediaId, path: finalPath, mimeType: req.file.mimetype });
-  res.status(201).json({ id: mediaId, sha256 });
+  await queue.add('process-media', { mediaId, path: finalPath, mimeType: req.file.mimetype, ingestedAt: new Date().toISOString() });
+  return res.status(201).json({ id: mediaId, sha256 });
 });
 
-app.listen(Number(process.env.API_PORT || 8080), () => {
-  console.log('backend listening');
+app.listen(apiPort, () => {
+  log('info', 'backend listening', { port: apiPort });
 });

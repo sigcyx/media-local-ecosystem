@@ -27,6 +27,24 @@ CREATE TABLE IF NOT EXISTS entities (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(320) NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS refresh_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_jti UUID NOT NULL UNIQUE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS semantic_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
@@ -52,6 +70,8 @@ CREATE INDEX IF NOT EXISTS idx_media_exif_gps ON media_exif (latitude, longitude
 CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_asset_id ON semantic_embeddings (asset_id);
 CREATE INDEX IF NOT EXISTS idx_facial_embeddings_asset_id ON facial_embeddings (asset_id);
 CREATE INDEX IF NOT EXISTS idx_facial_embeddings_entity_id ON facial_embeddings (entity_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_sessions_user_id ON refresh_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_refresh_sessions_expires_at ON refresh_sessions (expires_at);
 
 CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_ann
   ON semantic_embeddings
