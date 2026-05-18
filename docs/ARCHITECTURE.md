@@ -27,7 +27,12 @@
 - `albums`
 - `media_assets`
 - `media_exif`
-- `media_embeddings`
+- `ml_models`
+- `media_semantic_embeddings`
+- `face_detections`
+- `face_embeddings`
+- `face_clusters`
+- `face_cluster_members`
 - `face_clusters`
 
 ## 4. Intelligence Pipeline

@@ -26,14 +26,33 @@ new Worker('media-processing', async (job) => {
 
   const ai = await axios.post(`${process.env.AI_SERVICE_URL}/embed`, { media_id: mediaId, path: originalPath });
 
+  const modelRow = await pool.query(
+    `SELECT id
+     FROM ml_models
+     WHERE model_key = 'clip-vit-b32'
+       AND is_active = TRUE
+     LIMIT 1`
+  );
+
+  let modelId;
+  if (modelRow.rowCount === 0) {
+    const inserted = await pool.query(
+      `INSERT INTO ml_models (model_key, modality, embedding_dim, distance_metric)
+       VALUES ('clip-vit-b32', 'semantic', 512, 'cosine')
+       RETURNING id`
+    );
+    modelId = inserted.rows[0].id;
+  } else {
+    modelId = modelRow.rows[0].id;
+  }
+
   await pool.query(
-    `INSERT INTO media_embeddings (media_id, clip_embedding, face_embedding)
+    `INSERT INTO media_semantic_embeddings (media_id, model_id, embedding)
      VALUES ($1, $2, $3)
-     ON CONFLICT (media_id)
-     DO UPDATE SET clip_embedding = EXCLUDED.clip_embedding,
-                   face_embedding = EXCLUDED.face_embedding,
-                   updated_at = NOW()`,
-    [mediaId, ai.data.clip_embedding, ai.data.face_embedding]
+     ON CONFLICT (media_id, model_id)
+     DO UPDATE SET embedding = EXCLUDED.embedding,
+                   created_at = NOW()`,
+    [mediaId, modelId, ai.data.clip_embedding]
   );
 }, { connection: { url: process.env.REDIS_URL } });
 
