@@ -3,93 +3,60 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS media_assets (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  original_path TEXT NOT NULL,
-  sha256 TEXT NOT NULL UNIQUE,
-  mime_type TEXT,
-  created_at TIMESTAMPTZ DEFAULT NOW()
+  sha256_hash VARCHAR(64) UNIQUE NOT NULL,
+  file_path TEXT NOT NULL,
+  file_size_bytes BIGINT NOT NULL,
+  mime_type VARCHAR(50) NOT NULL,
+  captured_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS media_exif (
   media_id UUID PRIMARY KEY REFERENCES media_assets(id) ON DELETE CASCADE,
   camera_model TEXT,
-  captured_at TIMESTAMPTZ,
   latitude DOUBLE PRECISION,
   longitude DOUBLE PRECISION,
   shutter_speed TEXT,
   iso INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS ml_models (
-  id BIGSERIAL PRIMARY KEY,
-  model_key TEXT NOT NULL UNIQUE,
-  modality TEXT NOT NULL,
-  embedding_dim INTEGER NOT NULL,
-  distance_metric TEXT NOT NULL CHECK (distance_metric IN ('cosine', 'l2', 'ip')),
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+CREATE TABLE IF NOT EXISTS entities (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255) NOT NULL,
+  is_pet BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS media_semantic_embeddings (
+CREATE TABLE IF NOT EXISTS semantic_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  media_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
-  model_id BIGINT NOT NULL REFERENCES ml_models(id) ON DELETE RESTRICT,
+  asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
   embedding VECTOR(512) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (media_id, model_id)
+  UNIQUE (asset_id)
 );
 
-CREATE TABLE IF NOT EXISTS face_detections (
+CREATE TABLE IF NOT EXISTS facial_embeddings (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  media_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
-  bbox_x DOUBLE PRECISION NOT NULL,
-  bbox_y DOUBLE PRECISION NOT NULL,
-  bbox_w DOUBLE PRECISION NOT NULL,
-  bbox_h DOUBLE PRECISION NOT NULL,
-  confidence DOUBLE PRECISION,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS face_embeddings (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  face_detection_id UUID NOT NULL UNIQUE REFERENCES face_detections(id) ON DELETE CASCADE,
-  model_id BIGINT NOT NULL REFERENCES ml_models(id) ON DELETE RESTRICT,
+  asset_id UUID NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+  entity_id UUID REFERENCES entities(id) ON DELETE SET NULL,
+  bounding_box JSONB NOT NULL,
   embedding VECTOR(512) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS face_clusters (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  cluster_label TEXT,
-  canonical_embedding VECTOR(512),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS face_cluster_members (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  cluster_id UUID NOT NULL REFERENCES face_clusters(id) ON DELETE CASCADE,
-  face_detection_id UUID NOT NULL UNIQUE REFERENCES face_detections(id) ON DELETE CASCADE,
-  assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
+CREATE INDEX IF NOT EXISTS idx_media_assets_sha256_hash ON media_assets (sha256_hash);
+CREATE INDEX IF NOT EXISTS idx_media_assets_captured_at ON media_assets (captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_media_assets_created_at ON media_assets (created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_media_exif_captured_at ON media_exif (captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_media_exif_gps ON media_exif (latitude, longitude);
 
-CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_media_id ON media_semantic_embeddings (media_id);
-CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_model_id ON media_semantic_embeddings (model_id);
-CREATE INDEX IF NOT EXISTS idx_face_detections_media_id ON face_detections (media_id);
-CREATE INDEX IF NOT EXISTS idx_face_embeddings_model_id ON face_embeddings (model_id);
-CREATE INDEX IF NOT EXISTS idx_face_cluster_members_cluster_id ON face_cluster_members (cluster_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_asset_id ON semantic_embeddings (asset_id);
+CREATE INDEX IF NOT EXISTS idx_facial_embeddings_asset_id ON facial_embeddings (asset_id);
+CREATE INDEX IF NOT EXISTS idx_facial_embeddings_entity_id ON facial_embeddings (entity_id);
 
 CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_ann
-  ON media_semantic_embeddings
+  ON semantic_embeddings
   USING hnsw (embedding vector_cosine_ops);
 
-CREATE INDEX IF NOT EXISTS idx_face_embeddings_ann
-  ON face_embeddings
+CREATE INDEX IF NOT EXISTS idx_facial_embeddings_ann
+  ON facial_embeddings
   USING hnsw (embedding vector_cosine_ops);
-
-CREATE INDEX IF NOT EXISTS idx_face_clusters_ann
-  ON face_clusters
-  USING hnsw (canonical_embedding vector_cosine_ops);

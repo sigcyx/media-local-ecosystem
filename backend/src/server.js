@@ -36,7 +36,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   const filename = `${sha256}${ext}`;
   const finalPath = path.join(sourceRoot, filename);
 
-  const [{ count }] = (await pool.query('SELECT COUNT(*)::int AS count FROM media_assets WHERE sha256 = $1', [sha256])).rows;
+  const [{ count }] = (await pool.query('SELECT COUNT(*)::int AS count FROM media_assets WHERE sha256_hash = $1', [sha256])).rows;
   if (count > 0) {
     await fs.unlink(tempPath);
     return res.status(200).json({ duplicate: true, sha256 });
@@ -48,20 +48,19 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   const exif = await exifr.parse(finalPath, { gps: true }).catch(() => ({}));
 
   const insertAsset = await pool.query(
-    `INSERT INTO media_assets (original_path, sha256, mime_type)
-     VALUES ($1, $2, $3)
+    `INSERT INTO media_assets (sha256_hash, file_path, file_size_bytes, mime_type, captured_at)
+     VALUES ($1, $2, $3, $4, $5)
      RETURNING id`,
-    [finalPath, sha256, req.file.mimetype]
+    [sha256, finalPath, req.file.size, req.file.mimetype, exif?.DateTimeOriginal || null]
   );
 
   const mediaId = insertAsset.rows[0].id;
   await pool.query(
-    `INSERT INTO media_exif (media_id, camera_model, captured_at, latitude, longitude, shutter_speed, iso)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    `INSERT INTO media_exif (media_id, camera_model, latitude, longitude, shutter_speed, iso)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
     [
       mediaId,
       exif?.Model || null,
-      exif?.DateTimeOriginal || null,
       exif?.latitude || null,
       exif?.longitude || null,
       exif?.ExposureTime ? String(exif.ExposureTime) : null,

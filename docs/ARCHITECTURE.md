@@ -27,13 +27,9 @@
 - `albums`
 - `media_assets`
 - `media_exif`
-- `ml_models`
-- `media_semantic_embeddings`
-- `face_detections`
-- `face_embeddings`
-- `face_clusters`
-- `face_cluster_members`
-- `face_clusters`
+- `entities`
+- `semantic_embeddings`
+- `facial_embeddings`
 
 ## 4. Intelligence Pipeline
 Event-driven processing starts when media is ingested.
