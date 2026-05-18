@@ -22,7 +22,6 @@ const pool = new Pool({
   password: process.env.POSTGRES_PASSWORD
 });
 
-const queue = new Queue('media-processing', { connection: { url: process.env.REDIS_URL } });
 const sourceRoot = process.env.SOURCE_MEDIA_PATH || '/media/source';
 const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://ai-service:8000';
 const apiPort = Number(process.env.API_PORT || 8080);
@@ -30,6 +29,11 @@ const jwtAccessSecret = process.env.JWT_ACCESS_SECRET || 'dev-access-secret';
 const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret';
 const accessTtlSeconds = Number(process.env.JWT_ACCESS_TTL_SECONDS || 3600);
 const refreshTtlSeconds = Number(process.env.JWT_REFRESH_TTL_SECONDS || 2592000);
+const queueAttempts = Number(process.env.QUEUE_ATTEMPTS || 5);
+const queueBackoffDelayMs = Number(process.env.QUEUE_BACKOFF_DELAY_MS || 5000);
+const queueTimeoutMs = Number(process.env.QUEUE_TIMEOUT_MS || 120000);
+const queueRemoveOnComplete = Number(process.env.QUEUE_REMOVE_ON_COMPLETE || 1000);
+const queueRemoveOnFail = Number(process.env.QUEUE_REMOVE_ON_FAIL || 5000);
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 25);
 const maxUploadBytes = Number.isFinite(maxUploadMb) && maxUploadMb > 0 ? Math.floor(maxUploadMb * 1024 * 1024) : 25 * 1024 * 1024;
 const allowedMimeTypes = (process.env.ALLOWED_MIME_TYPES || 'image/jpeg,image/png,image/webp,image/heic,video/mp4,video/quicktime')
@@ -40,6 +44,19 @@ const allowedMimeTypeSet = new Set(allowedMimeTypes);
 const upload = multer({
   dest: '/tmp/uploads',
   limits: { fileSize: maxUploadBytes }
+});
+const queue = new Queue('media-processing', {
+  connection: { url: process.env.REDIS_URL },
+  defaultJobOptions: {
+    attempts: Number.isFinite(queueAttempts) && queueAttempts > 0 ? queueAttempts : 5,
+    backoff: {
+      type: 'exponential',
+      delay: Number.isFinite(queueBackoffDelayMs) && queueBackoffDelayMs > 0 ? queueBackoffDelayMs : 5000
+    },
+    timeout: Number.isFinite(queueTimeoutMs) && queueTimeoutMs > 0 ? queueTimeoutMs : 120000,
+    removeOnComplete: Number.isFinite(queueRemoveOnComplete) && queueRemoveOnComplete > 0 ? queueRemoveOnComplete : 1000,
+    removeOnFail: Number.isFinite(queueRemoveOnFail) && queueRemoveOnFail > 0 ? queueRemoveOnFail : 5000
+  }
 });
 
 const register = new client.Registry();

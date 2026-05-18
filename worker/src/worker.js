@@ -19,6 +19,7 @@ const pool = new Pool({
   password: process.env.POSTGRES_PASSWORD
 });
 const metricsPort = Number(process.env.WORKER_METRICS_PORT || 9091);
+const workerConcurrency = Number(process.env.WORKER_CONCURRENCY || 2);
 const queueClient = new Queue('media-processing', { connection: { url: process.env.REDIS_URL } });
 
 const register = new client.Registry();
@@ -65,6 +66,12 @@ new Worker('media-processing', async (job) => {
   const end = jobDurationMs.startTimer({ job: job.name });
   if ((job.attemptsMade || 0) > 0) {
     jobRetriesTotal.inc({ job: job.name });
+    log('warn', 'job retry attempt', {
+      job_id: job.id,
+      asset_id: mediaId,
+      attempts_made: job.attemptsMade,
+      max_attempts: job.opts?.attempts
+    });
   }
 
   try {
@@ -113,10 +120,19 @@ new Worker('media-processing', async (job) => {
     }
     jobsProcessedTotal.inc({ job: job.name, status: 'failed' });
     end();
-    log('error', 'job failed', { job_id: job.id, asset_id: mediaId, error_message: String(error?.message || error) });
+    log('error', 'job failed', {
+      job_id: job.id,
+      asset_id: mediaId,
+      attempts_made: job.attemptsMade,
+      max_attempts: job.opts?.attempts,
+      error_message: String(error?.message || error)
+    });
     throw error;
   }
-}, { connection: { url: process.env.REDIS_URL } });
+}, {
+  connection: { url: process.env.REDIS_URL },
+  concurrency: Number.isFinite(workerConcurrency) && workerConcurrency > 0 ? workerConcurrency : 2
+});
 
 http.createServer(async (req, res) => {
   if (req.url !== '/metrics') {
