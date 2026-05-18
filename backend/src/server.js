@@ -66,6 +66,10 @@ function decodeCursor(cursor) {
   }
 }
 
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
 function signAccessToken(user) {
   return jwt.sign(
     { sub: user.id, role: user.role, email: user.email, type: 'access' },
@@ -395,6 +399,153 @@ app.post('/search/semantic', async (req, res) => {
   }));
 
   return res.json({ results: items });
+});
+
+app.get('/assets/:assetId/faces', async (req, res) => {
+  const { assetId } = req.params;
+  if (!isUuid(assetId)) return res.status(400).json({ error: 'invalid assetId' });
+
+  const result = await pool.query(
+    `SELECT
+       f.id AS facial_embedding_id,
+       f.entity_id,
+       e.name AS entity_name,
+       f.bounding_box
+     FROM facial_embeddings f
+     LEFT JOIN entities e ON e.id = f.entity_id
+     WHERE f.asset_id = $1
+     ORDER BY f.created_at ASC`,
+    [assetId]
+  );
+
+  return res.json({ faces: result.rows });
+});
+
+app.post('/entities', async (req, res) => {
+  const name = String(req.body?.name || '').trim();
+  const isPet = Boolean(req.body?.is_pet);
+  if (!name) return res.status(400).json({ error: 'name is required' });
+
+  const existing = await pool.query(
+    `SELECT id FROM entities WHERE lower(name) = lower($1) LIMIT 1`,
+    [name]
+  );
+  if (existing.rowCount > 0) {
+    return res.status(409).json({ error: 'entity already exists' });
+  }
+
+  const inserted = await pool.query(
+    `INSERT INTO entities (name, is_pet)
+     VALUES ($1, $2)
+     RETURNING id`,
+    [name, isPet]
+  );
+  return res.status(201).json({ entity_id: inserted.rows[0].id });
+});
+
+app.get('/entities', async (req, res) => {
+  const result = await pool.query(
+    `SELECT
+       e.id AS entity_id,
+       e.name,
+       e.is_pet,
+       e.created_at,
+       COUNT(f.id)::int AS face_count,
+       MAX(COALESCE(m.captured_at, m.created_at)) AS latest_seen_at
+     FROM entities e
+     LEFT JOIN facial_embeddings f ON f.entity_id = e.id
+     LEFT JOIN media_assets m ON m.id = f.asset_id
+     GROUP BY e.id, e.name, e.is_pet, e.created_at
+     ORDER BY e.name ASC`
+  );
+  return res.json({ items: result.rows });
+});
+
+app.post('/faces/:facialEmbeddingId/assign-entity', async (req, res) => {
+  const { facialEmbeddingId } = req.params;
+  const entityId = String(req.body?.entity_id || '');
+  if (!isUuid(facialEmbeddingId)) return res.status(400).json({ error: 'invalid facialEmbeddingId' });
+  if (!isUuid(entityId)) return res.status(400).json({ error: 'invalid entity_id' });
+
+  const entity = await pool.query('SELECT id FROM entities WHERE id = $1 LIMIT 1', [entityId]);
+  if (entity.rowCount === 0) return res.status(404).json({ error: 'entity not found' });
+
+  const updated = await pool.query(
+    `UPDATE facial_embeddings
+     SET entity_id = $1
+     WHERE id = $2
+     RETURNING id`,
+    [entityId, facialEmbeddingId]
+  );
+  if (updated.rowCount === 0) return res.status(404).json({ error: 'face not found' });
+
+  return res.json({ ok: true });
+});
+
+app.get('/entities/:entityId/timeline', async (req, res) => {
+  const { entityId } = req.params;
+  if (!isUuid(entityId)) return res.status(400).json({ error: 'invalid entityId' });
+
+  const limitRaw = Number(req.query.limit || 30);
+  const limit = Number.isNaN(limitRaw) ? 30 : Math.min(Math.max(limitRaw, 1), 100);
+  const cursor = req.query.cursor ? decodeCursor(String(req.query.cursor)) : null;
+
+  const entityResult = await pool.query(
+    `SELECT id AS entity_id, name, is_pet
+     FROM entities
+     WHERE id = $1
+     LIMIT 1`,
+    [entityId]
+  );
+  if (entityResult.rowCount === 0) return res.status(404).json({ error: 'entity not found' });
+
+  const params = [entityId, limit + 1];
+  let where = '';
+  if (cursor) {
+    params.push(cursor.sortTs);
+    params.push(cursor.assetId);
+    where += ` AND (
+      COALESCE(t.captured_at, t.created_at) < $${params.length - 1}::timestamptz
+      OR (
+        COALESCE(t.captured_at, t.created_at) = $${params.length - 1}::timestamptz
+        AND t.asset_id < $${params.length}::uuid
+      )
+    )`;
+  }
+
+  const timeline = await pool.query(
+    `SELECT
+       t.asset_id,
+       t.file_path,
+       t.mime_type,
+       t.captured_at,
+       t.created_at,
+       t.face_count
+     FROM entity_timeline($1) t
+     WHERE 1=1 ${where}
+     ORDER BY COALESCE(t.captured_at, t.created_at) DESC, t.asset_id DESC
+     LIMIT $2`,
+    params
+  );
+
+  const hasMore = timeline.rows.length > limit;
+  const rows = hasMore ? timeline.rows.slice(0, limit) : timeline.rows;
+  let nextCursor = null;
+  if (hasMore && rows.length > 0) {
+    const last = rows[rows.length - 1];
+    nextCursor = encodeCursor(last.captured_at || last.created_at, last.asset_id);
+  }
+
+  const items = rows.map((row) => ({
+    asset_id: row.asset_id,
+    file_path: row.file_path,
+    mime_type: row.mime_type,
+    captured_at: row.captured_at,
+    face_count: Number(row.face_count),
+    thumbnail_url: `/api/assets/${row.asset_id}/thumbnail`
+  }));
+
+  return res.json({ entity: entityResult.rows[0], items, next_cursor: nextCursor });
 });
 
 app.listen(apiPort, () => {
