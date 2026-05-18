@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 import { verify as verifyArgon2 } from '@node-rs/argon2';
 import { Pool } from 'pg';
 import { Queue } from 'bullmq';
+import client from 'prom-client';
 
 dotenv.config();
 
@@ -31,7 +32,67 @@ const jwtRefreshSecret = process.env.JWT_REFRESH_SECRET || 'dev-refresh-secret';
 const accessTtlSeconds = Number(process.env.JWT_ACCESS_TTL_SECONDS || 3600);
 const refreshTtlSeconds = Number(process.env.JWT_REFRESH_TTL_SECONDS || 2592000);
 
+const register = new client.Registry();
+client.collectDefaultMetrics({ register, prefix: 'media_backend_' });
+
+const httpRequestsTotal = new client.Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['route', 'method', 'status']
+});
+const httpRequestDurationMs = new client.Histogram({
+  name: 'http_request_duration_ms',
+  help: 'HTTP request duration in ms',
+  labelNames: ['route', 'method'],
+  buckets: [10, 25, 50, 100, 250, 500, 1000, 2500, 5000]
+});
+const uploadRequestsTotal = new client.Counter({
+  name: 'upload_requests_total',
+  help: 'Upload request outcomes',
+  labelNames: ['result']
+});
+const semanticSearchTotal = new client.Counter({
+  name: 'semantic_search_total',
+  help: 'Semantic search outcomes',
+  labelNames: ['result']
+});
+const semanticSearchDurationMs = new client.Histogram({
+  name: 'semantic_search_duration_ms',
+  help: 'Semantic search duration in ms',
+  buckets: [10, 25, 50, 100, 250, 500, 1000, 2500]
+});
+const semanticSearchResultCount = new client.Histogram({
+  name: 'semantic_search_result_count',
+  help: 'Semantic search result counts',
+  buckets: [0, 1, 5, 10, 20, 50, 100]
+});
+
+register.registerMetric(httpRequestsTotal);
+register.registerMetric(httpRequestDurationMs);
+register.registerMetric(uploadRequestsTotal);
+register.registerMetric(semanticSearchTotal);
+register.registerMetric(semanticSearchDurationMs);
+register.registerMetric(semanticSearchResultCount);
+
 app.use(express.json());
+
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const route = req.route?.path || req.path;
+    const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+    httpRequestsTotal.inc({ route, method: req.method, status: String(res.statusCode) });
+    httpRequestDurationMs.observe({ route, method: req.method }, durationMs);
+    log('info', 'request completed', {
+      request_id: req.requestId,
+      route,
+      method: req.method,
+      status_code: res.statusCode,
+      duration_ms: Math.round(durationMs * 1000) / 1000
+    });
+  });
+  next();
+});
 
 app.use((req, res, next) => {
   const requestId = req.header('X-Request-Id') || crypto.randomUUID();
@@ -101,7 +162,7 @@ async function createSessionAndTokens(user) {
 }
 
 function authMiddleware(req, res, next) {
-  const publicPaths = ['/health', '/auth/login', '/auth/refresh'];
+  const publicPaths = ['/health', '/metrics', '/auth/login', '/auth/refresh'];
   if (publicPaths.includes(req.path)) return next();
 
   const auth = req.header('authorization') || '';
@@ -121,6 +182,11 @@ function authMiddleware(req, res, next) {
 app.use(authMiddleware);
 
 app.get('/health', (_, res) => res.json({ status: 'ok' }));
+
+app.get('/metrics', async (_, res) => {
+  res.set('Content-Type', register.contentType);
+  res.end(await register.metrics());
+});
 
 app.get('/ready', async (req, res) => {
   try {
@@ -224,6 +290,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
       [existingAssetId, sha256]
     );
     await fs.unlink(tempPath);
+    uploadRequestsTotal.inc({ result: 'duplicate' });
     return res.status(200).json({ duplicate: true, sha256 });
   }
 
@@ -268,6 +335,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     mimeType: req.file.mimetype,
     ingestedAt: new Date().toISOString()
   });
+  uploadRequestsTotal.inc({ result: 'accepted' });
   return res.status(201).json({ id: mediaId, sha256 });
 });
 
@@ -350,11 +418,14 @@ app.get('/uploads/activity', async (req, res) => {
 });
 
 app.post('/search/semantic', async (req, res) => {
+  const searchEnd = semanticSearchDurationMs.startTimer();
   const query = String(req.body?.query || '').trim();
   const limitRaw = Number(req.body?.limit ?? 20);
   const limit = Number.isNaN(limitRaw) ? 20 : Math.min(Math.max(limitRaw, 1), 100);
 
   if (!query) {
+    semanticSearchTotal.inc({ result: 'error' });
+    searchEnd();
     return res.status(400).json({ error: 'query is required' });
   }
 
@@ -376,14 +447,22 @@ app.post('/search/semantic', async (req, res) => {
         status_code: aiResponse.status,
         error_message: body
       });
+      semanticSearchTotal.inc({ result: 'error' });
+      searchEnd();
       return res.status(502).json({ error: 'embedding service unavailable' });
     }
 
     const payload = await aiResponse.json();
     embedding = payload.embedding;
-    if (!embedding) return res.status(502).json({ error: 'embedding service unavailable' });
+    if (!embedding) {
+      semanticSearchTotal.inc({ result: 'error' });
+      searchEnd();
+      return res.status(502).json({ error: 'embedding service unavailable' });
+    }
   } catch (error) {
     log('error', 'ai text embedding request error', { request_id: req.requestId, error_message: String(error) });
+    semanticSearchTotal.inc({ result: 'error' });
+    searchEnd();
     return res.status(502).json({ error: 'embedding service unavailable' });
   }
 
@@ -397,7 +476,9 @@ app.post('/search/semantic', async (req, res) => {
     ...row,
     thumbnail_url: `/api/assets/${row.asset_id}/thumbnail`
   }));
-
+  semanticSearchTotal.inc({ result: items.length ? 'ok' : 'empty' });
+  semanticSearchResultCount.observe(items.length);
+  searchEnd();
   return res.json({ results: items });
 });
 
