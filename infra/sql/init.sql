@@ -60,3 +60,100 @@ CREATE INDEX IF NOT EXISTS idx_semantic_embeddings_ann
 CREATE INDEX IF NOT EXISTS idx_facial_embeddings_ann
   ON facial_embeddings
   USING hnsw (embedding vector_cosine_ops);
+
+CREATE OR REPLACE FUNCTION semantic_search(query_vector vector(512), limit_n INTEGER DEFAULT 20)
+RETURNS TABLE (
+  asset_id UUID,
+  file_path TEXT,
+  mime_type VARCHAR(50),
+  captured_at TIMESTAMPTZ,
+  distance DOUBLE PRECISION
+)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT
+    m.id AS asset_id,
+    m.file_path,
+    m.mime_type,
+    m.captured_at,
+    (s.embedding <=> query_vector) AS distance
+  FROM semantic_embeddings s
+  JOIN media_assets m ON m.id = s.asset_id
+  ORDER BY s.embedding <=> query_vector
+  LIMIT GREATEST(limit_n, 1);
+$$;
+
+CREATE OR REPLACE FUNCTION facial_search(query_vector vector(512), limit_n INTEGER DEFAULT 20)
+RETURNS TABLE (
+  facial_embedding_id UUID,
+  asset_id UUID,
+  entity_id UUID,
+  entity_name VARCHAR(255),
+  bounding_box JSONB,
+  captured_at TIMESTAMPTZ,
+  distance DOUBLE PRECISION
+)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT
+    f.id AS facial_embedding_id,
+    f.asset_id,
+    f.entity_id,
+    e.name AS entity_name,
+    f.bounding_box,
+    m.captured_at,
+    (f.embedding <=> query_vector) AS distance
+  FROM facial_embeddings f
+  JOIN media_assets m ON m.id = f.asset_id
+  LEFT JOIN entities e ON e.id = f.entity_id
+  ORDER BY f.embedding <=> query_vector
+  LIMIT GREATEST(limit_n, 1);
+$$;
+
+CREATE OR REPLACE FUNCTION entity_timeline(entity_id UUID)
+RETURNS TABLE (
+  asset_id UUID,
+  entity_id UUID,
+  entity_name VARCHAR(255),
+  file_path TEXT,
+  mime_type VARCHAR(50),
+  captured_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ,
+  face_count BIGINT
+)
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT
+    m.id AS asset_id,
+    e.id AS entity_id,
+    e.name AS entity_name,
+    m.file_path,
+    m.mime_type,
+    m.captured_at,
+    m.created_at,
+    COUNT(f.id) AS face_count
+  FROM entities e
+  JOIN facial_embeddings f ON f.entity_id = e.id
+  JOIN media_assets m ON m.id = f.asset_id
+  WHERE e.id = entity_timeline.entity_id
+  GROUP BY e.id, e.name, m.id, m.file_path, m.mime_type, m.captured_at, m.created_at
+  ORDER BY m.captured_at DESC NULLS LAST, m.created_at DESC;
+$$;
+
+CREATE OR REPLACE VIEW v_entity_timeline AS
+SELECT
+  e.id AS entity_id,
+  e.name AS entity_name,
+  m.id AS asset_id,
+  m.file_path,
+  m.mime_type,
+  m.captured_at,
+  m.created_at,
+  COUNT(f.id) AS face_count
+FROM entities e
+JOIN facial_embeddings f ON f.entity_id = e.id
+JOIN media_assets m ON m.id = f.asset_id
+GROUP BY e.id, e.name, m.id, m.file_path, m.mime_type, m.captured_at, m.created_at;
